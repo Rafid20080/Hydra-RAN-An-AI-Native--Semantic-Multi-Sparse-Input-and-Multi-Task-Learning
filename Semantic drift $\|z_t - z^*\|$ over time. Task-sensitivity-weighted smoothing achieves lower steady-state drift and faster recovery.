@@ -1,0 +1,219 @@
+import numpy as np
+
+class SemanticBeliefUpdater:
+    """
+    Data-driven Semantic-SMTL belief updater.
+
+    All simulation outputs depend on:
+        1. Input dataset
+        2. Hyperparameters
+        3. Network conditions
+    """
+
+    def __init__(
+        self,
+        dataset,
+        beta=0.3,
+        lambda_min=0.50,
+        lambda_max=0.95,
+        use_task_weighted=True,
+        sparsity=None,
+        seed=42
+    ):
+
+        np.random.seed(seed)
+
+        self.dataset = np.asarray(dataset)
+        self.dim = self.dataset.shape[1]
+
+        self.beta = beta
+        self.lambda_min = lambda_min
+        self.lambda_max = lambda_max
+        self.use_task_weighted = use_task_weighted
+
+        # ============================================================
+        # DATA-DRIVEN SEMANTIC TARGET
+        # ============================================================
+
+        self.z_star = np.mean(self.dataset, axis=0)
+
+        # ============================================================
+        # INITIAL BELIEF FROM DATA
+        # ============================================================
+
+        self.z_initial = self.dataset[0].copy()
+
+        # ============================================================
+        # DATA-DRIVEN TASK SENSITIVITY
+        # ============================================================
+
+        feature_importance = np.var(self.dataset, axis=0)
+
+        feature_importance = (
+            feature_importance /
+            (feature_importance.max() + 1e-12)
+        )
+
+        self.lambda_d = (
+            lambda_min +
+            (lambda_max - lambda_min)
+            * feature_importance
+        )
+
+        # ============================================================
+        # DATA-DRIVEN SPARSITY
+        # ============================================================
+
+        if sparsity is None:
+
+            missing_ratio = np.isnan(self.dataset).mean()
+
+            zero_ratio = (
+                np.sum(self.dataset == 0)
+                / self.dataset.size
+            )
+
+            self.sparsity = max(
+                missing_ratio,
+                zero_ratio
+            )
+
+        else:
+            self.sparsity = sparsity
+
+        # ============================================================
+        # DATA-DRIVEN NOISE LEVEL
+        # ============================================================
+
+        self.encoder_noise_std = (
+            np.mean(
+                np.std(
+                    self.dataset,
+                    axis=0
+                )
+            ) * 0.10
+        )
+
+        self.drift_history = []
+
+    def compute_task_sensitivity_matrix(self):
+
+        return np.diag(self.lambda_d)
+
+    def generate_encoder_output(self, t):
+
+        sample = self.dataset[
+            t % len(self.dataset)
+        ]
+
+        effective_noise_std = (
+            self.encoder_noise_std /
+            (1.0 - self.sparsity + 0.1)
+        )
+
+        noise = np.random.normal(
+            0,
+            effective_noise_std,
+            self.dim
+        )
+
+        return sample + noise
+
+    def update_ema(self, z_prev, y_t):
+
+        return (
+            (1 - self.beta) * z_prev
+            + self.beta * y_t
+        )
+
+    def update_task_weighted(
+        self,
+        z_prev,
+        y_t,
+        Lambda
+    ):
+
+        beta_lambda = self.beta * Lambda
+
+        return (
+            (np.eye(self.dim) - beta_lambda)
+            @ z_prev
+            + beta_lambda @ y_t
+        )
+
+    def run_simulation(
+        self,
+        n_steps,
+        dropout_start,
+        dropout_duration
+    ):
+
+        z = self.z_initial.copy()
+
+        Lambda = self.compute_task_sensitivity_matrix()
+
+        self.drift_history = []
+
+        for t in range(n_steps):
+
+            dropout = (
+                dropout_start
+                <= t
+                <
+                dropout_start + dropout_duration
+            )
+
+            if dropout:
+
+                if self.use_task_weighted:
+
+                    beta_lambda = (
+                        self.beta * Lambda
+                    )
+
+                    z = (
+                        (np.eye(self.dim)
+                         - beta_lambda)
+                        @ z
+                        + beta_lambda @ self.z_star
+                    )
+
+                else:
+
+                    z = (
+                        (1 - self.beta)
+                        * z
+                        + self.beta
+                        * self.z_star
+                    )
+
+            else:
+
+                y_t = self.generate_encoder_output(t)
+
+                if self.use_task_weighted:
+
+                    z = self.update_task_weighted(
+                        z,
+                        y_t,
+                        Lambda
+                    )
+
+                else:
+
+                    z = self.update_ema(
+                        z,
+                        y_t
+                    )
+
+            drift = np.linalg.norm(
+                z - self.z_star
+            )
+
+            self.drift_history.append(
+                drift
+            )
+
+        return np.asarray(
+            self.drift_history
+        )
